@@ -1,0 +1,133 @@
+<html>
+<head>
+<title>PROJECT</title>
+<script type="text/javascript" src="dygraph-combined.js"></script>
+<style type="text/css">
+  #temperature .dygraph-legend {
+    width: 100px;
+    background-color: transparent !important;
+    left: 60px !important;
+  }
+</style>
+</head>
+
+<body>
+  <h3>
+    PROJECT Temperatures<br>
+  </h3>
+  <p>
+  <table>
+    <tr>
+      <td valign="top">
+        <div id="temp" style="width:800px; height:400px;"></div>
+      </td>
+      <td valign="top"></td>
+      <td valign="top">
+        <div id="tlabels"></div>
+      </td>
+    </tr>
+  </table>
+<br>
+<script type="text/javascript">
+  tempgraph = new Dygraph(
+    document.getElementById("temp"),
+    "temps.csv",
+    {
+    labelsUTC: false,
+    labelsDiv: document.getElementById("tlabels"),
+    colors: ["blue",
+             "green",
+             "magenta",
+             "red",
+             "orange",
+             "purple",
+             "olive",
+             "cyan",
+             "yellow"],
+    xlabel:  'Time [ local ]',
+    ylabel:  'Temperature [ K ]',
+    y2label: 'Heater Power [ % ]',
+
+    series: { ' 1:HEATERLABELONE': { axis: 'y2', color: 'maroon' },
+              ' 2:HEATERLABELTWO': { axis: 'y2', color: 'rosybrown' },
+    },
+
+    axes: { x:  {
+            },
+            y2: { valueRange: [-3.0, 103.0],
+                  sigFigs: 3,
+                  independentTicks: true,
+            },
+    },
+
+    digitsAfterDecimal: 3,
+    legend: 'always',
+    labelsSeparateLines: true,
+    connectSeparatedPoints: false,
+    labelsKMB: true
+    }
+  );
+</script>
+download data file here: <a href="temps.csv">temps.csv</a><br>
+</body>
+
+<body>
+  <h3>
+    PROJECT Pressure<br>
+  </h3>
+  <p>
+  <table>
+    <tr>
+      <td valign="top">
+        <div id="press" style="width:800px; height:400px;"></div>
+      </td>
+      <td valign="top"></td>
+      <td valign="top">
+        <div id="plabels"></div>
+      </td>
+    </tr>
+  </table>
+<br>
+<script type="text/javascript">
+  pressgraph = new Dygraph(
+    document.getElementById("press"),
+    "press.csv",
+    {
+      labelsUTC: false,
+      labelsDiv: document.getElementById("plabels"),
+      colors: ["red", "green", "blue", "magenta", "black", "grey", "#1c1cf0", "#66ff00", "#bf94e4", "#94a91f", "yellow"],
+      xlabel: 'Time [ local ]',
+      ylabel: 'Pressure [ Torr ]',
+
+      digitsAfterDecimal: 3,
+      legend: 'always',
+      labelsSeparateLines: true,
+      connectSeparatedPoints: false,
+      labelsKMB: true,
+
+      // Adjust space for the y-axis labels
+      yAxisLabelWidth: 80,
+
+      // Apply custom formatting to the y-axis only
+      axes: {
+        y: {
+          axisLabelFormatter: function(y) {
+            if (typeof y === 'number') {
+              if (Math.abs(y) > 99) {
+                return y.toFixed(1); // 1 digit of precision for large values (> 99)
+              } else if (Math.abs(y) < 1e-3) {
+                return y.toExponential(3); // Scientific notation for very small values (< 0.001)
+              } else {
+                return y.toFixed(5); // 5 digits of precision for smaller values
+              }
+            }
+            return y; // Return as-is for non-numeric values
+          }
+        }
+      }
+    }
+  );
+</script>
+download data file here: <a href="press.csv">press.csv</a><br>
+</body>
+

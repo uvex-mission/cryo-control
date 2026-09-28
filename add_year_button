@@ -1,0 +1,49 @@
+#!/bin/bash
+
+# @file   add_year_button
+# @brief  Adds a new year button to the data log webpage
+# @author David Hale <dhale@astro.caltech.edu>
+# @date   2021-01-06
+# @modified 2026-09-16 - loop over PROJECT read from a "project_names" file
+#
+# This script runs once per year.
+# It searches for the line <!-- DATA LOGS --> in the index.html file
+# and inserts after that the HTML code for the new year button.
+#
+# Project names are read from an ASCII file called "project_names",
+# one project name per line. Blank lines and lines starting with "#"
+# are ignored. By default that file is expected to live in the same
+# directory as this script -- edit PROJECT_NAMES_FILE below if it
+# lives somewhere else.
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_NAMES_FILE="$SCRIPT_DIR/project_names"
+PROJECT_HOME="$HOME/data/logs/lakeshore"
+
+if [ ! -e "$PROJECT_NAMES_FILE" ]
+then
+  echo "Project names file not found: $PROJECT_NAMES_FILE"
+  exit 1
+fi
+
+YEAR=`date +%Y`
+
+# Loop over every project name in the file. "|| [ -n "$PROJECT" ]"
+# makes sure the last line is processed even if the file has no
+# trailing newline.
+while IFS= read -r PROJECT || [ -n "$PROJECT" ]
+do
+  # skip blank lines and comment lines
+  [ -z "$PROJECT" ] && continue
+  case "$PROJECT" in
+    \#*) continue ;;
+  esac
+
+  echo "=== Processing project: $PROJECT ==="
+
+  PROJECTDIR="$PROJECT_HOME/$PROJECT"
+
+  sed -i '/^<\!-- DATA LOGS -->/a '\<button\ onclick\=\"window.location.href\=\'$YEAR\'\;\"\ class\=\"button\"\>$YEAR\<\/button\>'' $PROJECTDIR/index.html
+
+done < "$PROJECT_NAMES_FILE"  # File is fed into the while IFS=... loop here
+

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+<script type="text/javascript" src="dygraph-combined.js"></script>
+</head>
+
+<script type="text/javascript">
+  strain = new Dygraph(
+    document.getElementById("strain"),
+    "REPLACEME.pull.csv",
+    {
+    labelsUTC: false,
+    labelsDiv: document.getElementById("strainlabels"),
+        colors: ["red",
+                "black",
+                "blue",
+                "darkgreen",
+                "dodgerblue",
+                "lime",
+                "cyan",
+                "violet",
+                "fuchsia",
+                "gold",
+                "indigo",
+                "slategray",
+                "maroon",
+                "blueviolet",
+                "darkgoldenrod",
+                "salmon",
+                "olivedrab",
+                "purple",
+                "darkcyan",
+                "darkslateblue",
+                "indianred"],
+    xlabel: 'Time (local)',
+    ylabel: 'Data (unit)',
+    yLabelWidth: 12,
+
+    legend: 'always',
+    axes: {
+           x: {
+              },
+        y: {
+              valueRange: [],
+        },
+    },
+    connectSeparatedPoints: false,
+    sigFigs: '3',
+    labelsSeparateLines: true
+    }
+  );
+
+  function zoomGraphY() {
+    minValue = document.getElementById('ymin').value;
+    maxValue = document.getElementById('ymax').value;
+    minValue = parseFloat(minValue);
+    maxValue = parseFloat(maxValue);
+    strain.updateOptions({axes:{ y:{valueRange: [minValue, maxValue]}}
+    });
+  }
+
+</script>
+
+download the data file here: <a href="REPLACEME.pull.csv">REPLACEME.pull.csv</a><br>
+
+<h4>Notes:</h4>
+
+</body>
+
+</html>

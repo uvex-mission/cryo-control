@@ -1,0 +1,840 @@
+#!/usr/bin/python
+
+# -----------------------------------------------------------------------------
+# @file      logtemp.py
+# @brief     temperature logger
+# @author    David Hale <dhale@astro.caltech.edu>
+# @date      2022-01-03
+#
+# HOW TO USE:
+# -----------
+# 1. create a .ini file (see format below) to define the project name, lakeshore host, etc.
+# 2. ensure that ROOTPATH/index-html-src.in exists (source for index.html file)
+# 3. ensure that ROOTPATH/dygraph-combined.js exists (Javascript which does the graphing)
+# 4. run this script with the .ini file as an argument, i.e. "logtemp.py myfile.ini"
+#    (may be run from command line or cron)
+#
+# .ini file requirements:
+# -----------------------
+# [logtemp]      <-- required first line
+# name=          <-- project name
+# temphost=      <-- hostname for temperature source (i.e. Lakeshore, terminal server, etc.)
+# tempport=      <-- port number for temperature server
+# temprate=      <-- rate in seconds at which to log temperature
+# tempchans=     <-- comma separated list of Lakeshore channels (i.e. A,B,C1, etc.)
+# templabels=    <-- comma separated list of labels for temperature channels (i.e., Cold Plate, Radiation Shield, etc.)
+# heaterchans=   <-- comma separated list of heater channels
+# heaterlabels=  <-- comma separated list of heater labels
+# presshost=     <-- hostname for pressure server
+# pressport=     <-- port number of pressure server
+# pressrate=     <-- rate in seconds at which to log pressure
+# -----------------------------------------------------------------------------
+import argparse
+import configparser
+import errno
+import socket
+import select
+import sys # command line inputs
+import time
+from datetime import datetime,timedelta
+from random import uniform
+import os
+import shutil
+import signal
+import threading
+import numpy
+
+YEAR = datetime.now().strftime("%Y")
+ROOTPATH = "/disk/bifrost/uvexdet/data/logs/lakeshore/"  # Contains all projects
+
+
+# random period retry boundaries --
+# for retry, wait a random period between RND0 and RND1 seconds
+RND0 = 1
+RND1 = 5
+MAX_RETRIES = 3
+
+SOCK_TIMEOUT=5
+MUTEX_TIMEOUT=10
+
+mutex_temp = threading.Lock()
+mutex_press = threading.Lock()
+
+def foo():
+    print( time.ctime(), "(foo)", time.ctime() )
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+class ProgramKilled( Exception ):
+    pass
+
+# -----------------------------------------------------------------------------
+# @fn     signal_handler
+# @brief  function called when a signal is received
+# @param  signum
+# @param  frame
+# @return none
+# -----------------------------------------------------------------------------
+def signal_handler( signum, frame ):
+    raise ProgramKilled
+    return
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+class Job( threading.Thread ):
+    def __init__( self, interval, execute, *args, **kwargs ):
+        threading.Thread.__init__( self )
+        self.daemon = False
+        self.stopped = threading.Event()
+        self.interval = interval
+        self.execute = execute
+        self.args = args
+        self.kwargs = kwargs
+        return
+
+    def stop( self ):
+        self.stopped.set()
+        self.join()
+        return
+
+    def run( self ):
+        while not self.stopped.wait( self.interval.total_seconds() ):
+            self.execute( *self.args, **self.kwargs )
+        return
+
+
+# -----------------------------------------------------------------------------
+# @fn     open_socket
+# @brief  opens a socket to a given host:port
+# @param  host
+# @param  port
+# @return On success returns a handle to that socket.
+#         On error, returns False
+# -----------------------------------------------------------------------------
+def open_socket(host,port):
+    for res in socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM):
+        af, socktype, proto, canonname, sa=res
+        try:
+            s = socket.socket(af, socktype, proto)
+            s.settimeout(SOCK_TIMEOUT)
+        except socket.error as msg:
+            s = None
+            continue
+        try:
+            s.connect(sa)
+        except socket.error as msg:
+            s.close()
+            s = None
+            continue
+        break
+    if s is None:
+        print( time.ctime(), '(open_socket) ERROR: could not open socket on %s:%s' % (host, port), file=sys.stderr )
+        return False
+    else:
+#       print( time.ctime(), '(open_socket) socket opened on %s:%s' % (host, port), file=sys.stderr )
+        s.settimeout(SOCK_TIMEOUT)
+        return s
+
+
+# -----------------------------------------------------------------------------
+# @fn     get_temps
+# @brief  send command to Lakeshore to read temps and heaters
+# @param  host
+# @param  port
+# @param  channels, a list of temperature channels to read, IE. ['A','B', etc.]
+# @param  heaters, a list of heaters to read, IE. ['1','2']
+# @return list of return values in the order of the channels submitted
+#
+# When talking to the Perle terminal server, if busy then this function will
+# return 'BSY'. If there was an error opening the socket then it returns 'ERR'.
+# Values that can't be converted to float are returned as numpy.nan
+# 
+# return list is [ <date>, <ch1>, <ch2>, ..., <heater1>, ... ]
+#
+# -----------------------------------------------------------------------------
+def get_temps(host, port, channels, heaters=[]):
+
+    # don't let another thread run this at the same time
+    if mutex_temp.locked():
+        print( time.ctime(), "(get_temps) ERROR: mutex locked" )
+        return 'BSY'
+
+    # acquire mutex lock and open socket
+    mutex_temp.acquire( blocking=True, timeout=MUTEX_TIMEOUT )
+
+    sock = open_socket(host, port)
+
+    if not sock:
+        mutex_temp.release()
+        print( time.ctime(), "(get_temps) ERROR creating socket" )
+        return 'ERR'
+
+    # create an empty list, then start adding things to it (in order) for the return value
+    retlist=[]
+
+    # first the date is added, then each channel requested in the order requested
+    retlist.append( datetime.now().strftime("%D %T") )
+
+    # add the temperature and heaters into one list
+    chanlist = channels + heaters
+
+    # read all requested channels
+    for ch in chanlist:
+        try:
+            # if the channel ch is not a digit ('A', 'C2', etc.) then it's a temperature channel
+            if not ch.isdigit():
+                message = "KRDG? %s\n" % ch
+            # otherwise if it's a digit ('1', '2') then it's a heater
+            else:
+                message = "HTR? %s\n" % ch
+
+            # send the appropriate message
+            sock.sendall( message.encode( 'UTF-8' ) )
+
+            # read bytes up until we get endchar
+            endchar='\n'; dat=[]; temp=''
+            while endchar not in temp:
+                # recv up to 1k but it's always going to be delivered in multiple, smaller chunks
+                temp = sock.recv(1024).decode('UTF-8')
+
+                # the Perle terminal servers can only accept one connection at a time,
+                # and will return this if you try to exceed that
+                if 'Selected hunt group busy' in temp:
+                    print( time.ctime(), "(get_temps) multiple simultaneous connections forbidden" )
+                    sock.close()
+                    mutex_temp.release()
+                    return 'BSY'
+
+                # the end of the message -- get out
+                if endchar in temp:
+                    dat.append(temp[:temp.find(endchar)])
+                    break
+
+                # if not the end of message then append what was just read into the dat list
+                dat.append(temp)
+
+                if len(dat)>1:
+                    last=dat[-2]+dat[-1]
+                    if endchar in last:
+                        dat[-2]=last[:last.find(endchar)]
+                        dat.pop()
+                        break
+
+            # done receiving data so join all of the dat[] list together, convert to float,
+            # and append it to the return value list
+            retlist.append( float(''.join(dat)) )
+
+        except Exception as e:
+            print( time.ctime(), "(get_temps) exception: ", str(e) )
+            retlist.append( numpy.nan )
+            sock.close()
+            mutex_temp.release()
+            return 'ERR'
+
+    sock.close()
+    mutex_temp.release()
+
+    return retlist
+
+
+# -----------------------------------------------------------------------------
+# @fn     get_press
+# @brief  send command to pressure gauge to read pressure
+# @param  none
+# @return none
+#
+# This function is called by the scheduler.
+# -----------------------------------------------------------------------------
+def get_press(host, port):
+
+    # don't let another thread run this at the same time
+    if mutex_press.locked():
+        print( time.ctime(), "(get_press) ERROR: mutex locked" )
+        return 'BSY'
+
+    # acquire mutex lock and open socket
+    mutex_press.acquire( blocking=True, timeout=MUTEX_TIMEOUT )
+
+    sock = open_socket(host, port)
+
+    if not sock:
+        mutex_press.release()
+        print( time.ctime(), "(get_press) ERROR creating socket" )
+        return 'ERR'
+
+    # create an empty list, then start adding things to it (in order) for the return value
+    retlist=[]
+
+    # first the date is added, then each channel requested in the order requested
+    retlist.append( datetime.now().strftime("%D %T") )
+
+    d={}
+    bytesread=0
+    temp=''
+    reply=''
+
+    try:
+        # send the read command
+        sock.sendall( b'#01RD\r' )
+        time.sleep(0.2)
+
+        # read bytes up until the endchar
+        endchar='\r'; dat=[]; press=''
+        while endchar not in press:
+            # recv up to 1k but it's always going to be delivered in multiple, smaller chunks
+            press = sock.recv(1024).decode('UTF-8')
+            print(press)
+
+            # the Perle terminal servers can only accept one connection at a time,
+            # and will return this if you try to exceed that
+            if 'Selected hunt group busy' in press:
+                print( time.ctime(), "(get_press) multiple simultaneous connections forbidden" )
+                sock.close()
+                mutex_press.release()
+                return 'BSY'
+
+            # the end of the message, get out
+            if endchar in press:
+                dat.append(press[:press.find(endchar)])
+                break
+
+            # if not the end of the message then append what was just read into the dat list
+            dat.append(press)
+
+            if len(dat)>1:
+                last=dat[-2]+dat[-1]
+                if endchar in last:
+                    dat[-2]=last[:last.find(endchar)]
+                    dat.pop()
+                    break
+
+        # done receiving data so join all of the dat[] list together, convert to float,
+        # and append if to the return value list
+#       retlist.append( float(''.join(dat)) )
+        ret = ''.join(dat)
+        retlist.append( float(ret.split(" ")[1]) )
+
+    except Exception as e:
+        print( time.ctime(), "(get_press) exception: ", str(e) )
+        retlist.append( numpy.nan )
+        sock.close()
+        mutex_press.release()
+        return 'ERR'
+
+#   sock.sendall(b'#01RD\r')
+#   time.sleep(0.2)
+#
+#   while bytesread<13:
+#       ready=select.select([sock],[],[],3)
+#       if ready[0]:
+#           temp = sock.recv(1024).decode( 'UTF-8' )
+#           reply=reply+temp
+#           bytesread += len(temp)
+#       else:
+#           print( time.ctime(), "(get_press) select timeout" )
+#           return 'ERR'
+#
+#   pressure = float(reply[3:12])
+#   print( time.ctime(), "(get_press) pressure=", pressure )
+#
+#   d['press'] = pressure
+#
+#   d['time'] = datetime.now().strftime("%D %T")
+
+    sock.close()
+    mutex_press.release()
+    return retlist
+
+
+# ----- get_edwards -----------------------------------------------------------
+# @fn     get_edwards
+# @brief  send command to Edwards pressure gauge to read pressure
+# @param  host
+# @param  port
+# @return none
+#
+# This function is called by the scheduler.
+# -----------------------------------------------------------------------------
+def get_edwards(host, port):
+
+    # don't let another thread run this at the same time
+    if mutex_press.locked():
+        print( time.ctime(), "(get_edwards) ERROR: mutex locked" )
+        return 'BSY'
+
+    # acquire mutex lock and open socket
+    mutex_press.acquire( blocking=True, timeout=MUTEX_TIMEOUT )
+
+    sock = open_socket(host, port)
+
+    if not sock:
+        mutex_press.release()
+        print( time.ctime(), "(get_edwards) ERROR creating socket" )
+        return 'ERR'
+
+    # create an empty list, then start adding things to it (in order) for the return value
+    retlist=[]
+
+    # first the date is added, then each channel requested in the order requested
+    retlist.append( datetime.now().strftime("%D %T") )
+
+    d={}
+    bytesread=0
+    temp=''
+    reply=''
+
+    try:
+        # send the read command
+        sock.sendall( b'?GA1\r' )
+        time.sleep(0.2)
+
+        # read bytes up until the endchar
+        endchar='\r'; dat=[]; press=''
+        while endchar not in press:
+            # recv up to 1k but it's always going to be delivered in multiple, smaller chunks
+            press = sock.recv(1024).decode('UTF-8')
+
+            # the Perle terminal servers can only accept one connection at a time,
+            # and will return this if you try to exceed that
+            if 'Selected hunt group busy' in press:
+                print( time.ctime(), "(get_edwards) multiple simultaneous connections forbidden" )
+                sock.close()
+                mutex_press.release()
+                return 'BSY'
+
+            # the end of the message, get out
+            if endchar in press:
+                dat.append(press[:press.find(endchar)])
+                break
+
+            # if not the end of the message then append what was just read into the dat list
+            dat.append(press)
+
+            if len(dat)>1:
+                last=dat[-2]+dat[-1]
+                if endchar in last:
+                    dat[-2]=last[:last.find(endchar)]
+                    dat.pop()
+                    break
+
+        # done receiving data so join all of the dat[] list together, convert to float,
+        # and append if to the return value list
+        retlist.append( float(''.join(dat)) )
+
+    except Exception as e:
+        print( time.ctime(), "(get_edwards) exception: ", str(e) )
+        retlist.append( numpy.nan )
+        sock.close()
+        mutex_press.release()
+        return 'ERR'
+
+    sock.close()
+    mutex_press.release()
+    return retlist
+# ----- get_edwards -----------------------------------------------------------
+
+
+# -----------------------------------------------------------------------------
+# @fn     check_files
+# @brief  checks that the needed file structure exists
+# @param  logfile, name of log file (csv) that the logger will create
+# @return True on success, False on error
+# -----------------------------------------------------------------------------
+def check_files( logfile ):
+
+    # the directory of where data files will be saved
+    save_path = project_path + "/" + YEAR + "/" + datetime.now().strftime("%Y%m%d")
+
+    # check that all of the needed support files are in place
+    # 
+    try:
+        # create the log files (and directories, if needed)
+        dir = os.path.dirname( logfile )
+        if not os.path.exists(dir):
+            print( time.ctime(), "(check_files) creating path %s" % dir )
+            os.makedirs(dir)
+
+        # index.html file for this particular date displays the graph of today's data
+        html = save_path + "/index.html"
+
+        # if it doesn't exist then create one by reading the template 
+        # and replacing "PROJECT" with the actual project name (in upper case)
+        if not os.path.exists(html):
+            print( time.ctime(), "(check_files) creating %s" % html )
+            index_html_outfile = open( html, 'a' )
+            # the template is htmsrc
+            htmsrc = ROOTPATH + "/index-html-src.in"
+            if not os.path.exists( htmsrc ):
+                print( time.ctime(), "(check_files) ERROR: missing htmsrc file: ", htmsrc )
+                return False
+            # a list of things to find and replace (project name and heater labels)
+            findlist = [ "PROJECT", "HEATERLABELONE", "HEATERLABELTWO" ]
+            # the list of things to replace them with 
+            replacelist = [ project_name.upper() ]
+            replacelist += heater_labels
+            with open( htmsrc ) as inputfile:
+                # read a line at a time from "htmsrc" file
+                for line in inputfile:
+                    # perform any needed replacements
+                    for ff, rr in zip( findlist, replacelist):
+                        line = line.replace( ff, rr )
+                    # write back the line (with any replacements) to the index.html file
+                    index_html_outfile.write( line )
+            inputfile.close()
+            index_html_outfile.close()
+
+        # create a symbolic link to dygraph if needed --
+        # dygraph-combined.js is the Javascript which does the graphing magic.
+        # need to have at least a symlink in each directory
+        dylink = save_path + "/dygraph-combined.js"
+        if not os.path.exists(dylink):
+            # The actual Javascript is here
+            # dysrc  = ROOTPATH + "/dygraph-combined.js"
+            dysrc  = "../../../dygraph-combined.js"
+            os.symlink(dysrc, dylink)
+            print( time.ctime(), "(check_files) creating symlink %s -> %s" % (dylink, dysrc) )
+
+    except Exception as e:
+        print( time.ctime(), "(check_files) exception:", str(e) )
+        return False
+
+    return True
+
+
+# -----------------------------------------------------------------------------
+# @fn     logpress
+# @brief  workhorse function, calls get_press and does the logging
+# @param  none
+# @return none
+#
+# This function is called by the scheduler.
+# -----------------------------------------------------------------------------
+def logpress():
+
+    print( time.ctime(), "(logpress) starting" )
+
+    # create log file and needed paths if necessary
+    save_path = project_path + "/" + YEAR + "/" + datetime.now().strftime("%Y%m%d")
+    logfile = save_path + "/press.csv"
+    if not check_files( logfile ):
+        print( time.ctime(), "(logpress) ERROR setting up file structure" )
+        return
+
+    retryCount = 0
+    while retryCount < MAX_RETRIES:        # keep trying until not busy, or give up on error, until MAX_RETRIES
+        print( time.ctime(), "(logpress) calling get_press(%s, %s)" % ( press_host, press_port ) )
+        press = get_press( press_host, press_port )
+#       press = get_edwards( press_host, press_port )
+        print( time.ctime(), "(logpress) press=", press )
+        if press == None:
+            # no attempt to log nor try again on error
+            break
+        if press == 'ERR':
+            # no attempt to log nor try again on error
+            break
+        if press != 'BSY':
+            try:
+                if not os.path.exists(logfile):
+                    write_press_header = True
+                else:
+                    write_press_header = False
+
+                pressfile = open(logfile, 'a')
+
+                if write_press_header:
+                    pressfile.write( 'datetime, press\n' )
+
+                pressfile.write( '{:}, {:.8f}\n'.format(*press) )
+                pressfile.close()
+                break
+
+            except Exception as e:
+                print( time.ctime(), "(logpress) exception:", str(e) )
+                pressfile.close()
+                return
+
+        # wait some random period between RND0 and RND1 sec before trying again
+        retrytime = uniform(RND0,RND1)
+        retryCount += 1
+        if retryCount < MAX_RETRIES:
+            print( time.ctime(), "(logpress) attempt # %d failed, trying again in %.2f seconds" % (retryCount, retrytime) )
+            time.sleep(retrytime)
+
+        if ( retryCount == MAX_RETRIES ) and ( lkstemps == 'BSY' ):
+            print( time.ctime(), "(logpress) attempt # %d failed. max retries reached, giving up!" % retryCount )
+            return
+
+    print( time.ctime(), "(logpress) exiting" )
+
+    return
+
+
+# -----------------------------------------------------------------------------
+# @fn     logtemp
+# @brief  workhorse function, calls get_temps and does the logging
+# @param  none
+# @return none
+#
+# This function is called by the scheduler.
+# -----------------------------------------------------------------------------
+def logtemp():
+
+    print( time.ctime(), "(logtemp) starting" )
+
+    # create log file and needed paths if necessary
+    save_path = project_path + "/" + YEAR + "/" + datetime.now().strftime("%Y%m%d")
+    logfile = save_path + "/temps.csv"
+    if not check_files( logfile ):
+        print( time.ctime(), "(logtemp) ERROR setting up file structure" )
+        return
+
+    retryCount = 0
+    while retryCount < MAX_RETRIES:        # keep trying until not busy, or give up on error, until MAX_RETRIES
+        print( time.ctime(), "(logtemp) calling get_temps(%s, %s, %s, %s)" % ( temp_host, temp_port, temp_channels, heater_channels ) )
+        lkstemps = get_temps(temp_host, temp_port, temp_channels, heater_channels)
+        print( time.ctime(), "(logtemp) lkstemps=", lkstemps )
+        if lkstemps == None:
+            # no attempt to log nor try again on error
+            break
+        if lkstemps == 'ERR':
+            # no attempt to log nor try again on error
+            break
+        if lkstemps != 'BSY':
+            try:
+                if not os.path.exists(logfile):
+                    write_lks_header = True
+                else:
+                    write_lks_header = False
+
+                lkstempfile = open(logfile, 'a')
+
+                if write_lks_header:
+                    lkstempfile.write( 'datetime, ' + temp_header + '\n' )
+
+                format_list = '{:}'
+                for i in temp_channels:
+                    format_list += ', {:.3f}'
+                for i in heater_channels:
+                    format_list += ', {:.3f}'
+                format_list += '\n'
+
+                lkstempfile.write( format_list.format(*lkstemps) )
+                lkstempfile.close()
+                break
+
+            except Exception as e:
+                print( time.ctime(), "(logtemp) exception:", str(e) )
+                lkstempfile.close()
+                return
+
+        # wait some random period between RND0 and RND1 sec before trying again
+        retrytime = uniform(RND0,RND1)
+        retryCount += 1
+        if retryCount < MAX_RETRIES:
+            print( time.ctime(), "(logtemp) attempt # %d failed, trying again in %.2f seconds" % (retryCount, retrytime) )
+            time.sleep(retrytime)
+
+        if ( retryCount == MAX_RETRIES ) and ( lkstemps == 'BSY' ):
+            print( time.ctime(), "(logtemp) attempt # %d failed. max retries reached, giving up!" % retryCount )
+            return
+
+    print( time.ctime(), "(logtemp) exiting" )
+    return
+
+
+# -----------------------------------------------------------------------------
+# @fn     main
+# @brief  this is the "main" function
+# @param  none
+# @return none
+#
+# Sets up the scheduler to do the periodic logging
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+
+    global press_host
+    global press_port
+    global press_rate
+    global temp_host
+    global temp_port
+    global temp_rate
+    global project_name
+    global project_path
+    global temp_channels
+    global temp_header
+    global heater_channels
+
+    jobs_started = 0
+
+    signal.signal( signal.SIGTERM, signal_handler )
+    signal.signal( signal.SIGINT, signal_handler )
+
+    parser=argparse.ArgumentParser(description='logtemp')
+    parser.add_argument( 'inifile', help='.ini file required to configure the logger' )
+    args = parser.parse_args()
+
+    config = configparser.ConfigParser()
+    config.read( args.inifile )
+
+    # need to have a [logtemp] section
+    #
+    if 'logtemp' not in config:
+        print( time.ctime(), "(main) ERROR: %s missing section 'logtemp'" % args.inifile )
+        sys.exit(1)
+
+    # need to have a project name and it can't be empty
+    #
+    if 'name' in config['logtemp']:
+        if not config['logtemp']['name']:
+            print( time.ctime(), "(main) ERROR: 'name' in %s cannot be empty!" % args.inifile )
+            sys.exit(1)
+        project_name = config['logtemp']['name']
+    else:
+        print( time.ctime(), "(main) ERROR: %s missing config key 'name'" % args.inifile )
+        sys.exit(1)
+
+    # get the temperature channels to log from the ini file
+    #
+    if 'tempchans' in config['logtemp']:
+        temp_channels = config['logtemp']['tempchans'].split(',')
+    else:
+        print( time.ctime(), "(main) ERROR: %s missing config key 'tempchans'" % args.inifile )
+        sys.exit(1)
+    if temp_channels == ['']:
+        temp_channels=[]          # if the input is blank, make sure it is length 0
+
+    # get the temperature channel labels from the ini file
+    #
+    if 'templabels' in config['logtemp']:
+        temp_labels = config['logtemp']['templabels'].split(',')
+    else:
+        print( time.ctime(), "(main) ERROR: %s missing config key 'templabels'" % args.inifile )
+        sys.exit(1)
+    if temp_labels == ['']:
+        temp_labels=[]            # if the input is blank, make sure it is length 0
+
+    header_list = []
+
+    # must have the same number of temp labels as temp channels
+    #
+    if len(temp_channels) == len(temp_labels):
+        for chan, label in zip(temp_channels, temp_labels):
+            header_list.append( chan+":"+label )
+        temp_header = ', '.join( header_list )
+    else:
+        print( time.ctime(), "(main) ERROR: must have same number of tempchans (%d) as templabels (%d)" % \
+               ( len(temp_channels), len(temp_labels) ) )
+        sys.exit(1)
+
+    # get the heater channels to log from the ini file
+    #
+    if 'heaterchans' in config['logtemp']:
+        heater_channels = config['logtemp']['heaterchans'].split(',')
+    else:
+        print( time.ctime(), "(main) ERROR: %s missing config key 'heaterchans'" % args.inifile )
+        sys.exit(1)
+    if heater_channels == ['']:
+        heater_channels=[]        # if the input is blank, make sure it is length 0
+
+    # get the heater channel labels from the ini file
+    #
+    if 'heaterlabels' in config['logtemp']:
+        heater_labels = config['logtemp']['heaterlabels'].split(',')
+    else:
+        print( time.ctime(), "(main) ERROR: %s missing config key 'heaterlabels'" % args.inifile )
+        sys.exit(1)
+    if heater_labels == ['']:
+        heater_labels=[]          # if the input is blank, make sure it is length 0
+
+    # must have the same number of heater labels as heater channels
+    #
+    if len(heater_channels) == len(heater_labels):
+        for chan, label in zip(heater_channels, heater_labels):
+            header_list.append( chan+":"+label )
+        temp_header = ', '.join( header_list )
+    else:
+        print( time.ctime(), "(main) ERROR: must have same number of heaterchans (%d) as heaterlabels (%d)" % \
+               ( len(heater_channels), len(heater_labels) ) )
+        sys.exit(1)
+
+    # get temperature logging rate from ini file
+    #
+    if 'temprate' in config['logtemp']:
+        if config['logtemp']['temprate']:
+            temp_rate = int( config['logtemp']['temprate'] )
+        else:
+            temp_rate = 60
+
+    # get the host and port numbers from the ini file
+    #
+    if 'temphost' in config['logtemp']:
+        temp_host = config['logtemp']['temphost']
+    if 'tempport' in config['logtemp']:
+        temp_port = config['logtemp']['tempport']
+
+    project_path = ROOTPATH + "/" + project_name
+
+    # create project directory if needed
+    if not os.path.exists( project_path ):
+        print( time.ctime(), "(main) creating ", project_path )
+        try:
+            os.mkdir( project_path )
+        except Exception as e:
+            print( time.ctime(), "(main) exception creating directory:", str(e) )
+
+    # get the host and port numbers from the ini file
+    #
+    if 'presshost' in config['logtemp']:
+        press_host = config['logtemp']['presshost']
+    if 'pressport' in config['logtemp']:
+        press_port = config['logtemp']['pressport']
+
+    # get pressure logging rate from ini file
+    #
+    if 'pressrate' in config['logtemp']:
+        if config['logtemp']['pressrate']:
+            press_rate = int( config['logtemp']['pressrate'] )
+        else:
+            press_rate = 60
+
+    # if we have everything needed for temperature logging then start a thread
+    #
+    if temp_host and temp_port and temp_rate and ( temp_channels or heater_channels):
+        print( time.ctime(), "(main) starting temperature logging for %s" % project_name )
+        temp_logging = Job( interval=timedelta(seconds=temp_rate), execute=logtemp )
+        temp_logging.start()
+        jobs_started += 1
+    else:
+        temp_logging = False
+        print( time.ctime(), \
+               "(main) temperature logging disabled: missing one or more of temphost, tempport, temprate, (tempchans | heaterchans)" )
+
+    # if we have everything needed for pressure logging then start a thread
+    #
+    if press_host and press_port and press_rate:
+        print( time.ctime(), "(main) starting pressure logging" )
+        press_logging = Job( interval=timedelta(seconds=press_rate), execute=logpress )
+        press_logging.start()
+        jobs_started += 1
+    else:
+        press_logging = False
+        print( time.ctime(), "(main) pressure logging disabled: missing one or more of presshost, pressport, pressrate" )
+
+    # nothing to do
+    #
+    if not jobs_started:
+        print( time.ctime(), "(main) no logging started. bye!" )
+        sys.exit(0)
+
+    # sleep while the threads do the work
+    #
+    while True:
+        try:
+            time.sleep(1)
+        except ProgramKilled:
+            print( time.ctime(), "(main) program killed" )
+            if temp_logging:
+                temp_logging.stop()
+            if press_logging:
+                press_logging.stop()
+            break

@@ -1,0 +1,46 @@
+#!/bin/bash
+
+# This script checks whether the lakeshore logger(s) are running, and if not, starts it in the background
+# Put it in the crontab to periodically check the logger is running
+
+# Add to crontab:
+# */5 * * * * /disk/bifrost/uvexdet/lakeshore/logmonitor >> /disk/bifrost/uvexdet/lakeshore/.logmonitor.start > /dev/null 2>&1
+
+# Project names are read from an ASCII file called "project_names",
+# one project name per line. Blank lines and lines starting with "#"
+# are ignored. By default that file is expected to live in the same
+# directory as this script -- edit PROJECT_NAMES_FILE below if it
+# lives somewhere else.
+
+LOGHOME=/disk/bifrost/uvexdet/lakeshore/
+SCRIPT=uvex_logtemp
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+PROJECT_NAMES_FILE="$SCRIPT_DIR/project_names"
+
+if [ ! -e "$PROJECT_NAMES_FILE" ]
+then
+  echo "Project names file not found: $PROJECT_NAMES_FILE"
+  exit 1
+fi
+
+cd "$LOGHOME"
+while IFS= read -r PROJECT || [ -n "$PROJECT" ]
+do
+  # skip blank lines and comment lines
+  [ -z "$PROJECT" ] && continue
+  case "$PROJECT" in
+    \#*) continue ;;
+  esac
+
+  INIFILE="${PROJECT}.ini"
+  ret=$(pgrep -f -c -u "$USER" "$SCRIPT.*$INIFILE")  # Count processes matching both script and ini file
+
+  if [ "$ret" -lt 1 ]; then
+      echo "$(date) starting $PROJECT"
+      ./"$SCRIPT" "$INIFILE" < /dev/null > /dev/null 2>&1 &
+  else
+      echo "$(date) $PROJECT already running"
+  fi
+done < "$PROJECT_NAMES_FILE"
+

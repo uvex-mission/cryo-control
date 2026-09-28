@@ -1,0 +1,43 @@
+<html>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<head>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+.button {
+  border: none;
+  color: white;
+  padding: 15px 15px;
+  text-align: center;
+  text-decoration: none;
+  display: inline-block;
+  font-size: 15px;
+  margin: 5px 5px;
+  cursor: pointer;
+  color: #008cf7;
+  background-color: #ededf4;
+  border:1px solid black;
+}
+
+@media screen and (max-width: 800px) {
+  .button {
+    width: 100%; /* The width is 100%, when the viewport is 800px or smaller */
+    font-size: 5vw;
+  }
+}
+
+</style>
+</head>
+
+<h3>UVEX data logs</h3>
+
+<!-- DATA LOGS -->
+<button onclick="window.location.href='2026';" class="button">2026</button>
+<button onclick="window.location.href='2025';" class="button">2025</button>
+
+<br>
+
